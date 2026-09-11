@@ -4,7 +4,7 @@ Serverless Python webhook bridge for sending Tawk tickets to Freshdesk while pre
 
 ## Flow
 
-Tawk → `https://t8t.bar/tawk` → Vercel Python function → Freshdesk API
+Tawk → `https://tawk.t8t.bar/` → Vercel Python function → Freshdesk API
 
 ## Vercel environment variables
 
@@ -20,12 +20,12 @@ Do not commit secrets to this repository.
 
 1. Import this GitHub repository into Vercel.
 2. Add the environment variables above.
-3. Attach the custom domain `t8t.bar` to the Vercel project.
+3. Attach the custom domain `tawk.t8t.bar` to the Vercel project.
 4. Deploy/redeploy after adding the variables.
 5. Test:
 
 ```bash
-curl https://t8t.bar/tawk
+curl https://tawk.t8t.bar/
 ```
 
 Expected response:
@@ -42,7 +42,7 @@ Expected response:
 
 Create a webhook in Tawk with:
 
-- URL: `https://t8t.bar/tawk`
+- URL: `https://tawk.t8t.bar/`
 - Event: **New Ticket**
 - Secret: same value configured as `TAWK_SECRET` in Vercel
 
