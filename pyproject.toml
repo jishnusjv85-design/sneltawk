@@ -1,2 +1,2 @@
 [tool.vercel]
-entrypoint = "api.tawk:handler"
+entrypoint = "app:handler"
