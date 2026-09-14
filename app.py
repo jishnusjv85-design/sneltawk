@@ -24,6 +24,7 @@ def health_check():
         status="ok",
         service="snel-tawk-freshdesk",
         freshdesk_domain=FRESHDESK_DOMAIN,
+        version="1.1",
     )
 
 
@@ -63,9 +64,9 @@ def tawk_webhook():
         app.logger.exception("Freshdesk ticket creation failed")
         return jsonify(error="Freshdesk ticket creation failed"), 502
 
-    requester = payload.get("requester") or {}
     return jsonify(
         success=True,
         freshdesk_ticket_id=result.get("id"),
-        requester_email=requester.get("email", ""),
+        requester_email=result.get("_resolved_requester_email", ""),
+        email_source=result.get("_email_source", ""),
     )
