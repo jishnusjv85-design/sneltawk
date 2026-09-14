@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler
@@ -11,6 +12,14 @@ from http.server import BaseHTTPRequestHandler
 TAWK_SECRET = os.environ.get("TAWK_SECRET", "")
 FRESHDESK_API_KEY = os.environ.get("FRESHDESK_API_KEY", "")
 FRESHDESK_DOMAIN = os.environ.get("FRESHDESK_DOMAIN", "snel.freshdesk.com")
+
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+# These are service/relay addresses and must never become the Freshdesk requester.
+TAWK_EMAIL_DOMAINS = {
+    "tawk.to",
+    "tawk.email",
+}
 
 
 def _json_response(handler, status, payload):
@@ -35,16 +44,80 @@ def _verify_tawk_signature(raw_body, signature):
     return hmac.compare_digest(expected, signature.strip())
 
 
+def _normalise_email(value):
+    return (value or "").strip().strip("<>[](){}.,;:\"'").lower()
+
+
+def _is_tawk_service_email(email):
+    email = _normalise_email(email)
+    if "@" not in email:
+        return False
+
+    domain = email.rsplit("@", 1)[1]
+    return domain in TAWK_EMAIL_DOMAINS or domain.endswith(".tawk.to") or domain.endswith(".tawk.email")
+
+
+def _email_candidates_from_text(value):
+    if not value:
+        return []
+    return [_normalise_email(match) for match in EMAIL_RE.findall(str(value))]
+
+
+def _resolve_customer_email(payload):
+    """Return the visitor/customer email, never a Tawk relay address.
+
+    Tawk's official ticket:create payload exposes requester.email, but chatbot or
+    forwarding flows can make that a Tawk-owned relay address.  We therefore
+    inspect all visitor/contact-style fields we may receive and finally the
+    ticket message, where bots commonly include captured form answers.
+    """
+    requester = payload.get("requester") or {}
+    ticket = payload.get("ticket") or {}
+    visitor = payload.get("visitor") or {}
+    contact = payload.get("contact") or {}
+
+    candidates = [
+        visitor.get("email"),
+        contact.get("email"),
+        ticket.get("requesterEmail"),
+        ticket.get("email"),
+        requester.get("email"),
+    ]
+
+    # Prefer explicit structured customer fields first.
+    for candidate in candidates:
+        email = _normalise_email(candidate)
+        if email and EMAIL_RE.fullmatch(email) and not _is_tawk_service_email(email):
+            return email, "payload"
+
+    # If Tawk used a generated/relay requester, recover the address the customer
+    # supplied to the bot when it is present in the ticket message/subject.
+    text_candidates = []
+    text_candidates.extend(_email_candidates_from_text(ticket.get("message")))
+    text_candidates.extend(_email_candidates_from_text(ticket.get("subject")))
+
+    for email in text_candidates:
+        if not _is_tawk_service_email(email):
+            return email, "ticket_text"
+
+    original = _normalise_email(requester.get("email"))
+    if original and _is_tawk_service_email(original):
+        raise ValueError(
+            "Tawk supplied only a generated/relay email. "
+            "Customer email was not available in the ticket payload."
+        )
+
+    raise ValueError("Tawk ticket does not contain a usable customer email")
+
+
 def _create_freshdesk_ticket(payload, event_id=""):
     requester = payload.get("requester") or {}
     ticket = payload.get("ticket") or {}
     property_data = payload.get("property") or {}
 
-    email = (requester.get("email") or "").strip()
+    email, email_source = _resolve_customer_email(payload)
     name = (requester.get("name") or "").strip()
-
-    if not email:
-        raise ValueError("Tawk ticket does not contain requester.email")
+    original_requester_email = _normalise_email(requester.get("email"))
 
     subject = (ticket.get("subject") or "Tawk support request").strip()
     message = ticket.get("message") or "Ticket created from Tawk"
@@ -55,13 +128,17 @@ def _create_freshdesk_ticket(payload, event_id=""):
     metadata = [
         "",
         "---",
-        "Source: Tawk",
+        "Source: Tawk API webhook",
         f"Tawk property: {property_name}",
         f"Tawk ticket ID: {tawk_ticket_id}",
         f"Tawk ticket number: {tawk_human_id}",
         f"Tawk webhook event ID: {event_id}",
         f"Customer email: {email}",
+        f"Customer email source: {email_source}",
     ]
+
+    if original_requester_email and original_requester_email != email:
+        metadata.append(f"Original Tawk requester email ignored: {original_requester_email}")
 
     description = str(message) + "\n" + "\n".join(metadata)
 
@@ -71,7 +148,7 @@ def _create_freshdesk_ticket(payload, event_id=""):
         "description": description,
         "status": 2,
         "priority": 1,
-        "tags": ["tawk", "tawk-api"],
+        "tags": ["tawk", "tawk-api", "customer-email"],
     }
 
     if name:
@@ -88,14 +165,17 @@ def _create_freshdesk_ticket(payload, event_id=""):
             "Authorization": f"Basic {auth}",
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "Snel-Tawk-Freshdesk-Bridge/1.0",
+            "User-Agent": "Snel-Tawk-Freshdesk-Bridge/1.1",
         },
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            result = json.loads(response.read().decode("utf-8"))
+            result["_resolved_requester_email"] = email
+            result["_email_source"] = email_source
+            return result
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
@@ -115,6 +195,7 @@ class handler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "service": "snel-tawk-freshdesk",
                 "freshdesk_domain": FRESHDESK_DOMAIN,
+                "version": "1.1",
             },
         )
 
@@ -173,11 +254,10 @@ class handler(BaseHTTPRequestHandler):
             _json_response(self, 502, {"error": "Freshdesk ticket creation failed"})
             return
 
-        requester = payload.get("requester") or {}
         print(
             "Freshdesk ticket created:",
             result.get("id"),
-            requester.get("email", ""),
+            result.get("_resolved_requester_email", ""),
         )
 
         _json_response(
@@ -186,6 +266,7 @@ class handler(BaseHTTPRequestHandler):
             {
                 "success": True,
                 "freshdesk_ticket_id": result.get("id"),
-                "requester_email": requester.get("email", ""),
+                "requester_email": result.get("_resolved_requester_email", ""),
+                "email_source": result.get("_email_source", ""),
             },
         )
